@@ -1,0 +1,16 @@
+[package]
+name = "hermes-chat-editor"
+version = "0.1.0"
+edition = "2021"
+description = "Native Windows editor for Hermes Agent conversation history (state.db)"
+license = "MIT"
+
+[dependencies]
+eframe = "0.28"
+rusqlite = { version = "0.31", features = ["bundled", "backup"] }
+chrono = "0.4"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true

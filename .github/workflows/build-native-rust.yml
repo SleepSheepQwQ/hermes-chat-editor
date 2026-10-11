@@ -1,0 +1,53 @@
+name: build-native-rust
+
+# 用 GitHub 托管的 windows runner 编译 Rust 原生 app（egui/eframe）。
+# 本地无需安装 Rust。推 v* tag 自动构建并发 Release；也可手动触发。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: native-rs
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            native-rs/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('native-rs/Cargo.toml') }}
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Rename artifact
+        shell: pwsh
+        run: Copy-Item target/release/hermes-chat-editor.exe hermes-chat-editor-native.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-chat-editor-native-windows
+          path: native-rs/hermes-chat-editor-native.exe
+
+      - name: Attach to Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: native-rs/hermes-chat-editor-native.exe

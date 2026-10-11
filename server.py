@@ -108,7 +108,7 @@ class DB:
                 return None
             msgs = con.execute(
                 "SELECT id,role,content,reasoning_content,finish_reason,tool_name,"
-                "tool_calls,timestamp,active,compacted FROM messages "
+                "tool_calls,tool_call_id,timestamp,active,compacted FROM messages "
                 "WHERE session_id=? ORDER BY COALESCE(display_order, id), id",
                 (sid,),
             ).fetchall()
@@ -267,6 +267,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        # Never let a browser serve a stale app.js/css — this tool changes fast.
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        self.send_header("Pragma", "no-cache")
         self.end_headers()
         self.wfile.write(body)
 

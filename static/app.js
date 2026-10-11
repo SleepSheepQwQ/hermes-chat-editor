@@ -93,6 +93,36 @@ function msgEl(m) {
 
   const roleIcon = { user: "user", assistant: "robot", system: "settings", tool: "message" }[m.role] || "message";
 
+  // Decode tool_calls (assistant → function invocations) for a readable summary.
+  let toolCallSummary = "";
+  if (m.tool_calls) {
+    try {
+      const tc = typeof m.tool_calls === "string" ? JSON.parse(m.tool_calls) : m.tool_calls;
+      const names = (Array.isArray(tc) ? tc : [])
+        .map((c) => c?.function?.name || c?.name || c?.tool_name)
+        .filter(Boolean);
+      if (names.length) toolCallSummary = names.join(", ");
+    } catch { /* leave empty */ }
+  }
+
+  const content = m.content || "";
+  const isEmpty = content.trim() === "";
+  const isToolResult = m.role === "tool";
+
+  // Pretty-print tool-result JSON so it reads instead of being one long line.
+  let displayContent = content;
+  if (isToolResult && content) {
+    try { displayContent = JSON.stringify(JSON.parse(content), null, 2); } catch { /* keep raw */ }
+  }
+
+  // Human label for the body region.
+  let bodyNote = "";
+  if (isEmpty && toolCallSummary) bodyNote = `工具调用 → ${toolCallSummary}`;
+  else if (isEmpty && m.role === "assistant") bodyNote = "(空内容 — 工具调用载体 / 占位)";
+  else if (isToolResult) bodyNote = `${m.tool_name || "tool"} 返回结果`;
+
+  const rows = isToolResult ? 6 : (isEmpty ? 1 : 3);
+
   el.innerHTML = `
     <div class="head">
       <span class="role-ic">${icon(roleIcon, 16)}</span>
@@ -111,11 +141,18 @@ function msgEl(m) {
         <button class="del danger" title="删除">${icon("trash")}</button>
       </span>
     </div>
-    <textarea class="m-content" rows="3">${escapeHtml(m.content || "")}</textarea>
+    ${bodyNote ? `<div class="body-note">${escapeHtml(bodyNote)}</div>` : ""}
+    ${isToolResult
+      ? `<details class="tool-body"><summary>展开工具结果 (${content.length} 字符)</summary>
+           <textarea class="m-content" rows="${rows}">${escapeHtml(displayContent)}</textarea></details>`
+      : `<textarea class="m-content" rows="${rows}" placeholder="${isEmpty ? "（空内容）" : ""}">${escapeHtml(content)}</textarea>`}
     <details class="reason" ${m.reasoning_content ? "" : "hidden"}>
       <summary>reasoning</summary>
       <textarea class="m-reason" rows="2">${escapeHtml(m.reasoning_content || "")}</textarea>
     </details>`;
+
+  if (isEmpty) el.classList.add("is-empty");
+  if (isToolResult) el.classList.add("is-tool");
 
   const markDirty = () => el.classList.add("dirty");
   $(".m-content", el).addEventListener("input", markDirty);

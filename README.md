@@ -102,3 +102,12 @@ backups/             auto-written .bak snapshots (git-ignored)
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Native Rust app (no web layer)
+
+`native-rs/` is a native Windows build using **egui/eframe** + **rusqlite**
+(bundled SQLite) — a real desktop window, no browser, no HTTP server. It talks
+straight to `state.db`. Built in CI by `.github/workflows/build-native-rust.yml`
+(you do not need Rust installed locally).
+
+Icons/visual language follow the same Tabler set used by Chatbox.
