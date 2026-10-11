@@ -1,0 +1,63 @@
+name: build-windows-exe
+
+# 打包 Hermes Chat Editor 为单文件 Windows exe。
+# 触发：推 tag (v*) 自动构建并发 Release；也可在 Actions 页手动触发。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write   # 创建 Release 需要
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: Build single-file exe
+        # server.py 用标准库，无第三方依赖；static/ 作为数据目录打进去。
+        # --add-data 在 Windows 上用 ; 作分隔符。
+        run: >
+          pyinstaller --onefile --name hermes-chat-editor
+          --add-data "static;static"
+          --console
+          server.py
+
+      - name: Smoke test (exe starts & serves)
+        shell: pwsh
+        run: |
+          # 用一个空的临时 sqlite 当 state.db，仅验证 exe 能起、能响应。
+          python -c "import sqlite3; c=sqlite3.connect('probe.db'); c.execute('CREATE TABLE sessions(id TEXT, source TEXT, created_source TEXT, title TEXT, pinned INT, archived INT, message_count INT, model TEXT, started_at REAL, last_activity_at REAL)'); c.execute('CREATE TABLE messages(id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, reasoning_content TEXT, finish_reason TEXT, tool_name TEXT, tool_calls TEXT, timestamp REAL, active INT, compacted INT, display_order REAL, message_uid TEXT)'); c.commit(); c.close()"
+          $p = Start-Process -FilePath ".\dist\hermes-chat-editor.exe" -ArgumentList "--db","probe.db","--port","8799","--no-browser" -PassThru
+          Start-Sleep -Seconds 6
+          try {
+            $r = Invoke-WebRequest -Uri "http://127.0.0.1:8799/api/sessions" -UseBasicParsing -TimeoutSec 10
+            if ($r.StatusCode -ne 200) { throw "unexpected status $($r.StatusCode)" }
+            Write-Host "smoke test OK: /api/sessions -> 200"
+          } finally {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-chat-editor-windows
+          path: dist/hermes-chat-editor.exe
+
+      - name: Attach to Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/hermes-chat-editor.exe

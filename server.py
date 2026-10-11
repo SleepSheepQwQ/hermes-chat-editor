@@ -290,6 +290,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._static("index.html", "text/html; charset=utf-8")
         if path == "/app.js":
             return self._static("app.js", "application/javascript; charset=utf-8")
+        if path == "/icons.js":
+            return self._static("icons.js", "application/javascript; charset=utf-8")
         if path == "/style.css":
             return self._static("style.css", "text/css; charset=utf-8")
         if path == "/api/sessions":

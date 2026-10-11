@@ -91,8 +91,11 @@ function msgEl(m) {
   if (m.compacted) flags.push("compacted");
   if (m.tool_name) flags.push("tool:" + m.tool_name);
 
+  const roleIcon = { user: "user", assistant: "robot", system: "settings", tool: "message" }[m.role] || "message";
+
   el.innerHTML = `
     <div class="head">
+      <span class="role-ic">${icon(roleIcon, 16)}</span>
       <select class="m-role">
         ${["user", "assistant", "system", "tool"]
           .map((r) => `<option value="${r}" ${r === m.role ? "selected" : ""}>${r}</option>`)
@@ -102,10 +105,10 @@ function msgEl(m) {
       <span class="dirty-dot"></span>
       <span class="flags">${escapeHtml(flags.join(" · "))}</span>
       <span class="acts">
-        <button class="save">保存</button>
-        <button class="ins">↓插入</button>
-        <button class="trunc">✂裁剪至此</button>
-        <button class="del danger">删除</button>
+        <button class="save" title="保存">${icon("save")}</button>
+        <button class="ins" title="在此条后插入">${icon("insert")}</button>
+        <button class="trunc" title="裁剪至此（rewind）">${icon("scissors")}</button>
+        <button class="del danger" title="删除">${icon("trash")}</button>
       </span>
     </div>
     <textarea class="m-content" rows="3">${escapeHtml(m.content || "")}</textarea>
@@ -220,5 +223,8 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
+
+// Hydrate any static <span class="ic" data-icon="name"> placeholders.
+$$(".ic[data-icon]").forEach((e) => { e.innerHTML = icon(e.dataset.icon, 16); });
 
 loadSessions();

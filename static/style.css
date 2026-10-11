@@ -69,6 +69,12 @@ button.danger:hover { border-color: var(--danger); }
 .msg .head .id { color: var(--muted); }
 .msg .head .flags { color: var(--muted); margin-left: auto; }
 .msg .head .acts { display: flex; gap: 4px; }
+.msg .head .acts button { display: inline-flex; align-items: center; justify-content: center;
+  padding: 4px; line-height: 0; }
+.msg .head .role-ic { display: inline-flex; color: var(--muted); }
+.tabler-icon { display: block; }
+.ic { display: inline-flex; vertical-align: middle; }
+button .ic { margin-right: 2px; }
 .msg textarea { width: 100%; border: none; border-radius: 0; resize: vertical;
   min-height: 48px; background: var(--panel2); }
 .msg .reason { border-top: 1px dashed var(--border); }

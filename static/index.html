@@ -18,8 +18,8 @@
           <label><input type="checkbox" id="show-internal" /> 显示内部会话 (oneshot/tool/kanban)</label>
         </div>
         <div class="row">
-          <button id="new-session" class="primary">+ 新建会话</button>
-          <button id="refresh">刷新</button>
+          <button id="new-session" class="primary"><span class="ic" data-icon="plus"></span> 新建会话</button>
+          <button id="refresh"><span class="ic" data-icon="refresh"></span></button>
         </div>
       </header>
       <ul id="session-list"></ul>
@@ -42,7 +42,7 @@
           </select>
           <label class="pin"><input type="checkbox" id="s-pinned" /> 置顶</label>
           <label class="pin"><input type="checkbox" id="s-archived" /> 归档</label>
-          <button id="save-session" class="primary">保存会话属性</button>
+          <button id="save-session" class="primary"><span class="ic" data-icon="save"></span> 保存会话属性</button>
           <span id="s-meta" class="meta"></span>
         </div>
 
@@ -56,13 +56,14 @@
             <option value="tool">tool</option>
           </select>
           <textarea id="c-content" rows="2" placeholder="追加一条消息到末尾…（预填 / 伪造历史）"></textarea>
-          <button id="c-add" class="primary">追加</button>
+          <button id="c-add" class="primary"><span class="ic" data-icon="send"></span> 追加</button>
         </div>
       </section>
     </main>
   </div>
 
   <div id="toast"></div>
+  <script src="/icons.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>
