@@ -579,23 +579,28 @@ impl App {
         let (title, source, pin, arch) =
             (self.s_title.clone(), self.s_source.clone(), self.s_pinned as i64, self.s_archived as i64);
         let Some(conn) = self.begin_write() else { return };
-        if conn
-            .execute(
-                "UPDATE sessions SET title=?1, source=?2, created_source=?2, pinned=?3, archived=?4, \
-                 last_activity_at=?5 WHERE id=?6",
-                params![title, source, pin, arch, now_ts(), sid],
-            )
-            .is_ok()
-        {
-            self.o_title = self.s_title.clone();
-            self.o_source = self.s_source.clone();
-            self.o_pinned = self.s_pinned;
-            self.o_archived = self.s_archived;
-            drop(conn);
-            self.set_ok("会话属性已保存");
-            self.reload_sessions();
-        } else {
-            self.set_err("保存会话属性失败");
+        match conn.execute(
+            "UPDATE sessions SET title=?1, source=?2, created_source=?2, pinned=?3, archived=?4, \
+             last_activity_at=?5 WHERE id=?6",
+            params![title, source, pin, arch, now_ts(), sid],
+        ) {
+            Ok(_) => {
+                self.o_title = self.s_title.clone();
+                self.o_source = self.s_source.clone();
+                self.o_pinned = self.s_pinned;
+                self.o_archived = self.s_archived;
+                drop(conn);
+                self.set_ok("会话属性已保存");
+                self.reload_sessions();
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("UNIQUE") && msg.contains("title") {
+                    self.set_err("保存失败：标题与其它会话重复（title 需唯一）");
+                } else {
+                    self.set_err(format!("保存会话属性失败: {e}"));
+                }
+            }
         }
     }
 
@@ -630,22 +635,22 @@ impl App {
 
     fn create_session(&mut self) {
         let sid = format!("{}_{}", chrono::Local::now().format("%Y%m%d_%H%M%S"), &simple_uid()[..6]);
+        // sessions.title has a UNIQUE index — derive a title that won't collide.
+        let title = format!("新建会话 {}", chrono::Local::now().format("%m-%d %H:%M:%S"));
         let Some(conn) = self.begin_write() else { return };
-        if conn
-            .execute(
-                "INSERT INTO sessions(id,source,created_source,model,title,title_source,started_at,\
-                 last_activity_at,message_count,tool_call_count,pinned,archived,profile_name) \
-                 VALUES(?1,'cli','cli','manual','新建会话','manual',?2,?2,0,0,1,0,'default')",
-                params![sid, now_ts()],
-            )
-            .is_ok()
-        {
-            drop(conn);
-            self.set_ok(format!("已创建 {sid}"));
-            self.reload_sessions();
-            self.open_session(&sid);
-        } else {
-            self.set_err("创建会话失败");
+        match conn.execute(
+            "INSERT INTO sessions(id,source,created_source,model,title,title_source,started_at,\
+             last_activity_at,message_count,tool_call_count,pinned,archived,profile_name) \
+             VALUES(?1,'cli','cli','manual',?2,'manual',?3,?3,0,0,1,0,'default')",
+            params![sid, title, now_ts()],
+        ) {
+            Ok(_) => {
+                drop(conn);
+                self.set_ok(format!("已创建 {sid}"));
+                self.reload_sessions();
+                self.open_session(&sid);
+            }
+            Err(e) => self.set_err(format!("创建会话失败: {e}")),
         }
     }
 
