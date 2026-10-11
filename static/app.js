@@ -1,0 +1,224 @@
+"use strict";
+
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+let STATE = { sid: null, detail: null };
+
+async function api(path, body) {
+  const opt = body
+    ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
+    : {};
+  const res = await fetch(path, opt);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  return data;
+}
+
+function toast(msg, isErr = false) {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.classList.toggle("err", isErr);
+  t.classList.add("show");
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => t.classList.remove("show"), 2600);
+}
+
+function fmtTime(ts) {
+  if (!ts) return "";
+  const d = new Date(ts * 1000);
+  return d.toLocaleString();
+}
+
+// ---- session list --------------------------------------------------------
+async function loadSessions() {
+  const q = $("#search").value.trim();
+  const internal = $("#show-internal").checked ? "1" : "0";
+  const qs = new URLSearchParams();
+  if (q) qs.set("q", q);
+  qs.set("internal", internal);
+  const list = await api("/api/sessions?" + qs.toString());
+  const ul = $("#session-list");
+  ul.innerHTML = "";
+  for (const s of list) {
+    const li = document.createElement("li");
+    li.className = "s-item" + (s.id === STATE.sid ? " active" : "");
+    const badges = [];
+    if (s.pinned) badges.push("📌");
+    if (s.archived) badges.push("🗄");
+    li.innerHTML = `
+      <div class="t">${badges.join("")} ${escapeHtml(s.title || "(无标题)")}
+        <span class="badge">${escapeHtml(s.source || "?")}</span></div>
+      <div class="sub">${escapeHtml(s.id)} · ${s.message_count ?? 0} 条 · ${fmtTime(s.last_activity_at || s.started_at)}</div>`;
+    li.onclick = () => openSession(s.id);
+    ul.appendChild(li);
+  }
+  $("#side-foot").textContent = `${list.length} 个会话`;
+}
+
+// ---- open & render session -----------------------------------------------
+async function openSession(sid) {
+  STATE.sid = sid;
+  const d = await api("/api/session?id=" + encodeURIComponent(sid));
+  STATE.detail = d;
+  $$(".s-item").forEach((e) => e.classList.remove("active"));
+  $("#empty").hidden = true;
+  $("#editor").hidden = false;
+
+  const s = d.session;
+  $("#s-title").value = s.title || "";
+  $("#s-source").value = s.source || "cli";
+  $("#s-pinned").checked = !!s.pinned;
+  $("#s-archived").checked = !!s.archived;
+  $("#s-meta").textContent =
+    `ID ${s.id} · model ${s.model || "?"} · 创建 ${fmtTime(s.started_at)} · profile ${s.profile_name || "default"}`;
+
+  renderMessages(d.messages);
+  loadSessions();
+}
+
+function renderMessages(msgs) {
+  const box = $("#messages");
+  box.innerHTML = "";
+  for (const m of msgs) box.appendChild(msgEl(m));
+}
+
+function msgEl(m) {
+  const el = document.createElement("div");
+  el.className = "msg " + (m.role || "user");
+  el.dataset.id = m.id;
+  const flags = [];
+  if (!m.active) flags.push("inactive");
+  if (m.compacted) flags.push("compacted");
+  if (m.tool_name) flags.push("tool:" + m.tool_name);
+
+  el.innerHTML = `
+    <div class="head">
+      <select class="m-role">
+        ${["user", "assistant", "system", "tool"]
+          .map((r) => `<option value="${r}" ${r === m.role ? "selected" : ""}>${r}</option>`)
+          .join("")}
+      </select>
+      <span class="id">#${m.id}</span>
+      <span class="dirty-dot"></span>
+      <span class="flags">${escapeHtml(flags.join(" · "))}</span>
+      <span class="acts">
+        <button class="save">保存</button>
+        <button class="ins">↓插入</button>
+        <button class="trunc">✂裁剪至此</button>
+        <button class="del danger">删除</button>
+      </span>
+    </div>
+    <textarea class="m-content" rows="3">${escapeHtml(m.content || "")}</textarea>
+    <details class="reason" ${m.reasoning_content ? "" : "hidden"}>
+      <summary>reasoning</summary>
+      <textarea class="m-reason" rows="2">${escapeHtml(m.reasoning_content || "")}</textarea>
+    </details>`;
+
+  const markDirty = () => el.classList.add("dirty");
+  $(".m-content", el).addEventListener("input", markDirty);
+  $(".m-role", el).addEventListener("change", markDirty);
+  const rz = $(".m-reason", el);
+  if (rz) rz.addEventListener("input", markDirty);
+
+  $(".save", el).onclick = async () => {
+    try {
+      await api("/api/update_message", {
+        id: m.id,
+        fields: {
+          role: $(".m-role", el).value,
+          content: $(".m-content", el).value,
+          reasoning_content: rz ? rz.value : "",
+        },
+      });
+      el.classList.remove("dirty");
+      toast("已保存 #" + m.id);
+    } catch (e) { toast(e.message, true); }
+  };
+  $(".del", el).onclick = async () => {
+    if (!confirm("删除消息 #" + m.id + "？")) return;
+    try {
+      await api("/api/delete_message", { id: m.id });
+      toast("已删除 #" + m.id);
+      openSession(STATE.sid);
+    } catch (e) { toast(e.message, true); }
+  };
+  $(".ins", el).onclick = async () => {
+    const role = prompt("插入新消息的角色 (user/assistant/system/tool):", "assistant");
+    if (!role) return;
+    const content = prompt("内容:", "");
+    if (content === null) return;
+    try {
+      await api("/api/add_message", {
+        session_id: STATE.sid, role, content, after_id: m.id,
+      });
+      toast("已插入");
+      openSession(STATE.sid);
+    } catch (e) { toast(e.message, true); }
+  };
+  $(".trunc", el).onclick = async () => {
+    if (!confirm("裁剪（rewind）：删除 #" + m.id + " 之后的所有消息？")) return;
+    try {
+      const r = await api("/api/truncate_after", { session_id: STATE.sid, id: m.id });
+      toast("已删除 " + r.deleted + " 条后续消息");
+      openSession(STATE.sid);
+    } catch (e) { toast(e.message, true); }
+  };
+  return el;
+}
+
+// ---- session-level actions ------------------------------------------------
+$("#save-session").onclick = async () => {
+  try {
+    await api("/api/update_session", {
+      id: STATE.sid,
+      fields: {
+        title: $("#s-title").value,
+        source: $("#s-source").value,
+        created_source: $("#s-source").value,
+        pinned: $("#s-pinned").checked ? 1 : 0,
+        archived: $("#s-archived").checked ? 1 : 0,
+      },
+    });
+    toast("会话属性已保存");
+    openSession(STATE.sid);
+  } catch (e) { toast(e.message, true); }
+};
+
+$("#c-add").onclick = async () => {
+  const content = $("#c-content").value;
+  if (!content.trim()) return;
+  try {
+    await api("/api/add_message", {
+      session_id: STATE.sid, role: $("#c-role").value, content,
+    });
+    $("#c-content").value = "";
+    toast("已追加");
+    openSession(STATE.sid);
+  } catch (e) { toast(e.message, true); }
+};
+
+$("#new-session").onclick = async () => {
+  const title = prompt("新会话标题:", "新建会话");
+  if (title === null) return;
+  try {
+    const r = await api("/api/create_session", { title, source: "cli", model: "manual" });
+    toast("已创建 " + r.id);
+    await loadSessions();
+    openSession(r.id);
+  } catch (e) { toast(e.message, true); }
+};
+
+$("#refresh").onclick = loadSessions;
+$("#search").addEventListener("input", debounce(loadSessions, 250));
+$("#show-internal").addEventListener("change", loadSessions);
+
+function debounce(fn, ms) {
+  let t;
+  return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+loadSessions();
