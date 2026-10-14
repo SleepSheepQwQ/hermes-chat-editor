@@ -11,19 +11,42 @@ applied to Hermes sessions.
 
 ## What it does
 
-- **Browse & search** every session in `state.db` (title / id).
+- **Browse & search** every session in `state.db` (title / id / message body).
 - **Reveal internal sessions** — Hermes hides `oneshot` / `tool` / `kanban`
   sources from its own pickers. A checkbox shows them.
 - **Edit a message** in place: content and role.
 - **Insert** a message after any row, or **append** to the end — including
   fabricating an `assistant` turn (the manual equivalent of *prefill*).
 - **Rewind / truncate** — delete everything after a chosen message.
+- **Reorder messages** (move up / down).
+- **Batch operations** — multi-select messages, delete them, or change role.
 - **Delete** individual messages.
 - **Re-tag a session**: title, `source` (e.g. flip `oneshot` → `cli` so it shows
   up in the Hermes session list), pin, archive.
 - **Create a session from scratch** and populate it message by message.
+- **Export** the current session as **JSONL / Markdown / HTML**.
+- **Import** a session from a JSONL file (creates a new session).
+- **Switch database profiles** (multiple `HERMES_HOME` / `profiles` paths).
+- **Light / dark theme** toggle.
+- **Lightweight Markdown preview** for message content.
 - **Automatic backup** of `state.db` into `./backups/` before every write
   (keeps the 30 newest), via the SQLite backup API (WAL-safe).
+
+## Safety features
+
+- **Read-only mode by default.** The app opens the DB read-only; you must
+  explicitly untick "只读模式" (read-only) to enable editing. This prevents
+  accidental writes.
+- **Write protection while Hermes is running.** If Hermes is running (recent
+  `gateway_heartbeats`), writes are blocked unless you tick "强制写入"
+  (force write). Editing a live DB risks being overwritten by Hermes' in-memory
+  session cache.
+- **Safe write path**: `busy_timeout=30s`, `PRAGMA foreign_keys=ON`, and the
+  editor lets SQLite triggers auto-assign `display_order` / `message_uid` on
+  insert — it does **not** pass those columns, avoiding corruption of Hermes'
+  display identity. After writes it syncs `sessions.message_count`.
+- **Confirm dialogs** for destructive operations (delete / truncate / restore).
+- **Unsaved-changes guard** when switching sessions / refreshing / creating.
 
 Tool-call carrier turns (empty `content` + `tool_calls`) are shown as
 `工具调用 → <names>`; tool results are collapsible. Icons/visual language follow
@@ -42,6 +65,9 @@ You do **not** need Rust installed. GitHub Actions
 ```
 hermes-chat-editor-native.exe                   # auto-detects %LOCALAPPDATA%\hermes\state.db
 hermes-chat-editor-native.exe C:\path\state.db  # or pass a db path
+hermes-chat-editor-native.exe --readonly        # open read-only (default)
+hermes-chat-editor-native.exe --writable        # open in writable mode
+hermes-chat-editor-native.exe --help          # show CLI help
 ```
 
 Close the Hermes gateway/desktop before editing — a running Hermes caches its
@@ -59,8 +85,8 @@ cargo run --release
 
 - Power-user tool. Editing `state.db` by hand can confuse a *running* Hermes
   process — close it first, reopen after.
-- A session's `system_prompt` lives on the `sessions` row and is not edited here;
-  this tool focuses on the conversation transcript.
+- A session's `system_prompt` lives on the `sessions` row and can be edited via
+  the "系统提示词…" button.
 
 ## Project layout
 
