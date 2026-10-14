@@ -579,7 +579,7 @@ impl App {
         if ids.is_empty() {
             return;
         }
-        let Some(conn) = self.begin_write() else { return };
+        let Some(mut conn) = self.begin_write() else { return };
         let tx = match conn.transaction() {
             Ok(t) => t,
             Err(e) => {
@@ -627,7 +627,7 @@ impl App {
         if ids.is_empty() {
             return;
         }
-        let Some(conn) = self.begin_write() else { return };
+        let Some(mut conn) = self.begin_write() else { return };
         let tx = match conn.transaction() {
             Ok(t) => t,
             Err(e) => {
@@ -704,14 +704,14 @@ impl App {
         };
         let ma = &self.messages[a];
         let mb = &self.messages[b];
-        let (ida, ord_a) = (ma.id, ma.ts);
-        let (idb, ord_b) = (mb.id, mb.ts);
+        let ida = ma.id;
+        let idb = mb.id;
         // We can't reliably read display_order if NULL (backfill pending). As a
         // safe portable approach, swap their `timestamp` values too? No — that
         // would rewrite history. Instead, only swap display_order when both are
         // non-NULL. For NULL cases we fall back to swapping timestamps is NOT
         // done; we simply refuse with a status message.
-        let Some(conn) = self.begin_write() else { return };
+        let Some(mut conn) = self.begin_write() else { return };
         // Read both display_order values.
         let get_ord = |conn: &Connection, id: i64| -> Option<f64> {
             conn.query_row(
@@ -1009,7 +1009,7 @@ impl App {
             self.modal = Modal::DiscardThenSelect(path.to_string_lossy().into_owned());
             return;
         }
-        self.db_path = path;
+        self.db_path = path.clone();
         self.read_only = true;
         self.selected_msgs.clear();
         self.selected = None;
@@ -1103,40 +1103,42 @@ impl App {
             self.set_err("文件中没有可导入的消息");
             return;
         }
-        let Some(conn) = self.begin_write() else { return };
+        let Some(mut conn) = self.begin_write() else { return };
         let sid = format!("{}_{}", chrono::Local::now().format("%Y%m%d_%H%M%S"), &simple_uid()[..6]);
         let title = format!("导入 {}", chrono::Local::now().format("%m-%d %H:%M:%S"));
-        let tx = match conn.transaction() {
-            Ok(t) => t,
-            Err(e) => {
-                self.set_err(format!("开启事务失败: {e}"));
-                return;
-            }
-        };
-        let ok = tx
-            .execute(
-                "INSERT INTO sessions(id,source,created_source,model,title,title_source,started_at,\
-                 last_activity_at,message_count,tool_call_count,pinned,archived,profile_name) \
-                 VALUES(?1,'cli','cli','manual',?2,'manual',?3,?3,0,0,1,0,'default')",
-                params![sid, title, now_ts()],
-            )
-            .is_ok();
-        if ok {
-            for (role, content) in &rows {
-                let finish: Option<&str> = if role == "assistant" { Some("stop") } else { None };
-                if tx
-                    .execute(
-                        "INSERT INTO messages(session_id,role,content,timestamp,active,compacted,finish_reason) \
-                         VALUES(?1,?2,?3,?4,1,0,?5)",
-                        params![sid, role, content, now_ts(), finish],
-                    )
-                    .is_err()
-                {
-                    break;
+        let done = {
+            let tx = match conn.transaction() {
+                Ok(t) => t,
+                Err(e) => {
+                    self.set_err(format!("开启事务失败: {e}"));
+                    return;
+                }
+            };
+            let ok = tx
+                .execute(
+                    "INSERT INTO sessions(id,source,created_source,model,title,title_source,started_at,\
+                     last_activity_at,message_count,tool_call_count,pinned,archived,profile_name) \
+                     VALUES(?1,'cli','cli','manual',?2,'manual',?3,?3,0,0,1,0,'default')",
+                    params![sid, title, now_ts()],
+                )
+                .is_ok();
+            if ok {
+                for (role, content) in &rows {
+                    let finish: Option<&str> = if role == "assistant" { Some("stop") } else { None };
+                    if tx
+                        .execute(
+                            "INSERT INTO messages(session_id,role,content,timestamp,active,compacted,finish_reason) \
+                             VALUES(?1,?2,?3,?4,1,0,?5)",
+                            params![sid, role, content, now_ts(), finish],
+                        )
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
             }
-        }
-        let done = ok && tx.commit().is_ok();
+            ok && tx.commit().is_ok()
+        };
         drop(conn);
         if done {
             self.set_ok(format!("已导入 {} 条消息到新会话 {sid}", rows.len()));
@@ -2055,7 +2057,7 @@ impl App {
                     .resizable(false)
                     .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                     .show(ctx, |ui| {
-                        ui.label("输入 JSONL 文件路径（每行: {"role":..., "content":...}）");
+                        ui.label(r#"输入 JSONL 文件路径（每行: {"role":..., "content":...}）"#);
                         ui.add(
                             egui::TextEdit::singleline(&mut buf)
                                 .hint_text("C:/path/to/session.jsonl")
