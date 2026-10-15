@@ -124,6 +124,7 @@ struct SessionRow {
     pinned: bool,
     archived: bool,
     msg_count: i64,
+    last_activity: f64,
 }
 
 #[derive(Clone)]
@@ -156,6 +157,7 @@ enum Modal {
     Insert { after_idx: usize, role: String, content: String },
     SystemPrompt { buf: String, dirty: bool },
     ImportPath { buf: String },
+    ConfirmDeleteSession(String),
 }
 
 struct App {
@@ -165,6 +167,8 @@ struct App {
     search: String,
     search_focused: bool,
     show_internal: bool,
+    source_filter: String,
+    last_source_filter: String,
     sessions: Vec<SessionRow>,
     selected: Option<String>,
     // selected session editable attrs + originals (for dirty detection)
@@ -202,6 +206,8 @@ impl App {
             search: String::new(),
             search_focused: false,
             show_internal: false,
+            source_filter: String::new(),
+            last_source_filter: String::new(),
             sessions: vec![],
             selected: None,
             s_title: String::new(),
@@ -377,12 +383,15 @@ impl App {
         };
         let mut sql = String::from(
             "SELECT id,COALESCE(title,''),COALESCE(source,''),COALESCE(pinned,0),\
-             COALESCE(archived,0),COALESCE(message_count,0) FROM sessions",
+             COALESCE(archived,0),COALESCE(message_count,0),COALESCE(last_activity_at,started_at) FROM sessions",
         );
         let mut conds: Vec<String> = vec![];
         if !self.show_internal {
             let list = INTERNAL_SOURCES.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(",");
             conds.push(format!("COALESCE(source,'') NOT IN ({list})"));
+        }
+        if !self.source_filter.is_empty() {
+            conds.push(format!("COALESCE(source,'')='{}'", self.source_filter.replace('\'', "''")));
         }
         if !self.search.trim().is_empty() {
             // title OR id OR any message body matches (portable LIKE; no FTS5 dependency)
@@ -408,6 +417,7 @@ impl App {
                     pinned: r.get::<_, i64>(3)? != 0,
                     archived: r.get::<_, i64>(4)? != 0,
                     msg_count: r.get(5)?,
+                    last_activity: r.get(6)?,
                 })
             }) {
                 for row in it.flatten() {
@@ -997,6 +1007,83 @@ impl App {
         }
     }
 
+    /// Delete a session and all its messages (destructive; caller confirms).
+    fn delete_session(&mut self, sid: &str) {
+        let Some(mut conn) = self.begin_write() else { return };
+        let tx = match conn.transaction() {
+            Ok(t) => t,
+            Err(e) => {
+                self.set_err(format!("开启事务失败: {e}"));
+                return;
+            }
+        };
+        let n_msgs = match tx.execute("DELETE FROM messages WHERE session_id=?1", params![sid]) {
+            Ok(n) => n,
+            Err(e) => {
+                self.set_err(format!("删除消息失败: {e}"));
+                return;
+            }
+        };
+        let ok_sess = tx.execute("DELETE FROM sessions WHERE id=?1", params![sid]).is_ok();
+        let _ = tx.execute("DELETE FROM session_model_usage WHERE session_id=?1", params![sid]);
+        let _ = tx.execute("DELETE FROM compression_locks WHERE session_id=?1", params![sid]);
+        if ok_sess && tx.commit().is_ok() {
+            drop(conn);
+            if self.selected.as_deref() == Some(sid) {
+                self.selected = None;
+                self.messages.clear();
+                self.selected_msgs.clear();
+            }
+            self.reload_sessions();
+            self.set_ok(format!("已删除会话 {sid}（{n_msgs} 条消息）"));
+        } else {
+            self.set_err("删除会话失败（已回滚）");
+        }
+    }
+
+    /// Export ALL sessions (one Markdown file each) into ./exports_all/.
+    fn export_all_sessions(&mut self) {
+        let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join("exports_all");
+        if std::fs::create_dir_all(&dir).is_err() {
+            self.set_err("无法创建导出目录");
+            return;
+        }
+        let sessions = self.sessions.clone();
+        if sessions.is_empty() {
+            self.set_err("没有会话可导出");
+            return;
+        }
+        let mut exported = 0usize;
+        let conn = match self.conn_readonly() {
+            Ok(c) => c,
+            Err(e) => {
+                self.set_err(format!("打开数据库失败: {e}"));
+                return;
+            }
+        };
+        for s in &sessions {
+            let mut out = format!("# {}\n\nID: {}\nSource: {}\n\n", s.title, s.id, s.source);
+            if let Ok(mut st) = conn.prepare(
+                "SELECT COALESCE(role,''),COALESCE(content,'') FROM messages \
+                 WHERE session_id=?1 AND (active=1 OR compacted=1) \
+                 ORDER BY COALESCE(display_order,id),id",
+            ) {
+                if let Ok(rows) = st.query_map(params![s.id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                }) {
+                    for m in rows.flatten() {
+                        out.push_str(&format!("\n## {}\n\n{}\n", m.0, m.1));
+                    }
+                }
+            }
+            let fname = format!("{}.md", sanitize_filename(&format!("{}_{}", s.title, &s.id[..s.id.len().min(8)])));
+            if std::fs::write(dir.join(fname), out).is_ok() {
+                exported += 1;
+            }
+        }
+        self.set_ok(format!("已导出 {exported} 个会话到 {}", dir.display()));
+    }
+
     fn recount(&self) {
         if let (Some(sid), Ok(conn)) = (&self.selected, self.conn_write()) {
             let _ = conn.execute(
@@ -1319,11 +1406,24 @@ impl eframe::App for App {
             if i.modifiers.command && i.key_pressed(egui::Key::F) {
                 self.search_focused = true;
             }
+            if i.modifiers.command && i.key_pressed(egui::Key::A) {
+                // Select all messages in the current session.
+                self.selected_msgs = (0..self.messages.len()).collect();
+                self.set_ok(format!("已全选 {} 条消息", self.messages.len()));
+            }
+            if i.key_pressed(egui::Key::Escape) {
+                if !self.selected_msgs.is_empty() {
+                    self.selected_msgs.clear();
+                } else if !self.search.is_empty() {
+                    self.search.clear();
+                }
+            }
             if i.modifiers.command && i.key_pressed(egui::Key::Z) {
-                // Undo: clear dirty flags (a lightweight undo for unsaved edits)
+                // Undo: revert all unsaved edits (content/role/reasoning).
                 for m in self.messages.iter_mut() {
                     m.edit_content = m.content.clone();
                     m.edit_role = m.role.clone();
+                    m.edit_reasoning = m.reasoning.clone();
                     m.dirty = false;
                 }
                 self.s_title = self.o_title.clone();
@@ -1346,6 +1446,7 @@ impl eframe::App for App {
         let mut do_export_jsonl = false;
         let mut do_export_md = false;
         let mut do_export_html = false;
+        let mut do_export_all = false;
         let mut do_import = false;
         let mut do_delete_selected = false;
         let mut set_role: Option<String> = None;
@@ -1396,9 +1497,42 @@ impl eframe::App for App {
                 if self.search_focused {
                     resp.request_focus();
                 }
+                if !self.search.is_empty() && ui.small_button("✕").clicked() {
+                    self.search.clear();
+                    changed = true;
+                }
             });
+            ui.horizontal(|ui| {
+                ui.label("来源");
+                egui::ComboBox::from_id_source("source_filter")
+                    .selected_text(if self.source_filter.is_empty() { "全部" } else { &self.source_filter })
+                    .width(120.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.source_filter, String::new(), "全部");
+                        for src in ["cli", "desktop", "telegram", "oneshot", "tool", "kanban", "api-server", "subagent", "cron"] {
+                            ui.selectable_value(&mut self.source_filter, src.to_string(), src);
+                        }
+                    });
+                if self.source_filter.is_empty() {
+                    ui.weak("");
+                }
+            });
+            let filter_changed = {
+                let mut f = false;
+                // detect combo change via a polled marker is complex; simplest:
+                // ComboBox writes directly to self.source_filter, we reload when
+                // the value differs from the last-loaded value.
+                f = self.source_filter != self.last_source_filter;
+                if f {
+                    self.last_source_filter = self.source_filter.clone();
+                }
+                f
+            };
+            if changed || filter_changed {
+                self.reload_sessions();
+            }
             if ui.checkbox(&mut self.show_internal, "显示内部会话 (oneshot/tool/kanban)").changed() {
-                changed = true;
+                self.reload_sessions();
             }
             ui.horizontal(|ui| {
                 if ui.button("+ 新建会话").clicked() {
@@ -1408,9 +1542,6 @@ impl eframe::App for App {
                     do_refresh = true;
                 }
             });
-            if changed {
-                self.reload_sessions();
-            }
             ui.separator();
 
             // Profile picker
@@ -1433,6 +1564,8 @@ impl eframe::App for App {
 
             let sessions = self.sessions.clone();
             let mut to_select: Option<String> = None;
+            let mut to_delete: Option<String> = None;
+            let mut to_copy_id: Option<String> = None;
             egui::ScrollArea::vertical().id_source("sess_scroll").show(ui, |ui| {
                 for s in &sessions {
                     let sel = self.selected.as_deref() == Some(s.id.as_str());
@@ -1443,25 +1576,62 @@ impl eframe::App for App {
                     if s.archived {
                         marks.push_str("🗄 ");
                     }
+                    let tsf = fmt_ts(s.last_activity);
                     let label = format!(
-                        "{}{}  [{}]\n{} · {} 条",
+                        "{}{}  [{}]\n{} · {} 条{}",
                         marks,
                         if s.title.is_empty() { "(无标题)" } else { &s.title },
                         source_display(&s.source),
                         &s.id,
-                        s.msg_count
+                        s.msg_count,
+                        if tsf.is_empty() { String::new() } else { format!(" · {}", &tsf[5..tsf.len().min(16)]) }
                     );
-                    if ui.selectable_label(sel, label).clicked() {
+                    let resp = ui
+                        .selectable_label(sel, label)
+                        .on_hover_text(format!("ID: {}\n最后活动: {}", s.id, if tsf.is_empty() { "-" } else { &tsf }));
+                    if resp.clicked() {
                         to_select = Some(s.id.clone());
                     }
+                    resp.context_menu(|ui| {
+                        if ui.button("复制 ID").clicked() {
+                            to_copy_id = Some(s.id.clone());
+                            ui.close_menu();
+                        }
+                        if ui.button("删除会话…").clicked() {
+                            to_delete = Some(s.id.clone());
+                            ui.close_menu();
+                        }
+                        if ui.button("复制标题").clicked() {
+                            ctx.copy_text(s.title.clone());
+                            ui.close_menu();
+                        }
+                    });
                 }
             });
             if let Some(sid) = to_select {
                 self.try_select(sid);
             }
+            if let Some(sid) = to_delete {
+                self.modal = Modal::ConfirmDeleteSession(sid);
+            }
+            if let Some(sid) = to_copy_id {
+                ctx.copy_text(sid);
+                self.set_ok("已复制会话 ID 到剪贴板");
+            }
             ui.separator();
             ui.horizontal(|ui| {
-                ui.label(format!("{} 个会话", self.sessions.len()));
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} 个会话 · 共 {} 条消息 · 选中 {} 条",
+                        self.sessions.len(),
+                        self.sessions.iter().map(|s| s.msg_count).sum::<i64>(),
+                        self.selected_msgs.len()
+                    ))
+                    .small()
+                    .weak(),
+                );
+            });
+            ui.horizontal(|ui| {
                 if ui.small_button("备份文件夹").clicked() {
                     do_open_backups = true;
                 }
@@ -1479,13 +1649,16 @@ impl eframe::App for App {
                 if ui.small_button("导出 HTML").clicked() {
                     do_export_html = true;
                 }
+                if ui.small_button("导出全部会话").clicked() {
+                    do_export_all = true;
+                }
             });
             ui.horizontal(|ui| {
                 if ui.small_button("导入 JSONL…").clicked() {
                     do_import = true;
                 }
                 if !self.selected_msgs.is_empty() {
-                    if ui.small_button("批量删除").clicked() {
+                    if ui.small_button(format!("批量删除({})", self.selected_msgs.len())).clicked() {
                         do_delete_selected = true;
                     }
                 }
@@ -1699,14 +1872,31 @@ impl eframe::App for App {
                                         ui.label(preview);
                                     });
                                 }
-                                let rows = if is_empty { 1 } else { 3 };
+                                // Auto-height editor: grow with content lines, clamped.
+                                let line_count = self.messages[i].edit_content.lines().count();
+                                let rows = if is_empty { 1 } else { line_count.clamp(3, 20) };
                                 let te = egui::TextEdit::multiline(&mut self.messages[i].edit_content)
                                     .desired_width(f32::INFINITY)
-                                    .desired_rows(rows);
+                                    .desired_rows(rows)
+                                    .hint_text(if self.messages[i].edit_content.is_empty() { "(空)" } else { "" });
                                 if ui.add(te).changed() {
                                     self.messages[i].dirty = true;
                                 }
                             }
+                            // character count + copy button (below content)
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!("{} 字", self.messages[i].edit_content.chars().count()))
+                                        .small()
+                                        .weak(),
+                                );
+                                if !self.messages[i].edit_content.is_empty() {
+                                    if ui.small_button("📋 复制").on_hover_text("复制消息内容到剪贴板").clicked() {
+                                        ctx.copy_text(self.messages[i].edit_content.clone());
+                                        self.set_ok(format!("已复制消息 #{id} 内容"));
+                                    }
+                                }
+                            });
 
                             if !self.messages[i].reasoning.is_empty() || !self.messages[i].edit_reasoning.is_empty() {
                                 egui::CollapsingHeader::new("reasoning（思考过程，可编辑）").id_source(format!("reason_{id}")).show(
@@ -1801,6 +1991,9 @@ impl eframe::App for App {
                 None => self.set_err("导出 HTML 失败（可能无选中会话）"),
             }
         }
+        if do_export_all {
+            self.export_all_sessions();
+        }
         if do_import {
             self.modal = Modal::ImportPath { buf: String::new() };
         }
@@ -1828,6 +2021,43 @@ impl App {
         let modal = std::mem::replace(&mut self.modal, Modal::None);
         match modal {
             Modal::None => {}
+            Modal::ConfirmDeleteSession(sid) => {
+                let title = self
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == sid)
+                    .map(|s| s.title.clone())
+                    .unwrap_or_default();
+                let n = self
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == sid)
+                    .map(|s| s.msg_count)
+                    .unwrap_or(0);
+                let mut keep = true;
+                let mut decided = false;
+                egui::Window::new("确认删除会话")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                    .show(ctx, |ui| {
+                        ui.label(format!("删除会话及其全部消息？\n标题: {title}\nID: {sid}\n消息数: {n}\n（此操作会先自动备份数据库）"));
+                        ui.horizontal(|ui| {
+                            if ui.button("删除").clicked() {
+                                decided = true;
+                                keep = false;
+                            }
+                            if ui.button("取消").clicked() {
+                                keep = false;
+                            }
+                        });
+                    });
+                if decided {
+                    self.delete_session(&sid);
+                } else if keep {
+                    self.modal = Modal::ConfirmDeleteSession(sid);
+                }
+            }
             Modal::ConfirmDelete(indices) => {
                 if indices.is_empty() {
                     return;
