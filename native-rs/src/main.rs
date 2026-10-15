@@ -140,6 +140,7 @@ struct MessageRow {
     // UI edit buffers
     edit_content: String,
     edit_role: String,
+    edit_reasoning: String,
     dirty: bool,
 }
 
@@ -362,7 +363,8 @@ impl App {
     }
 
     fn any_dirty(&self) -> bool {
-        self.attrs_dirty() || self.messages.iter().any(|m| m.dirty)
+        self.attrs_dirty()
+            || self.messages.iter().any(|m| m.dirty || m.edit_reasoning != m.reasoning)
     }
 
     fn reload_sessions(&mut self) {
@@ -459,11 +461,12 @@ impl App {
             if let Ok(it) = st.query_map(params![sid], |r| {
                 let role: String = r.get(1)?;
                 let content: String = r.get(2)?;
+                let reasoning: String = r.get(3)?;
                 Ok(MessageRow {
                     id: r.get(0)?,
                     role: role.clone(),
                     content: content.clone(),
-                    reasoning: r.get(3)?,
+                    reasoning: reasoning.clone(),
                     tool_name: r.get(4)?,
                     tool_calls: r.get(5)?,
                     active: r.get::<_, i64>(6)? != 0,
@@ -471,6 +474,7 @@ impl App {
                     ts: r.get(8)?,
                     edit_content: content,
                     edit_role: role,
+                    edit_reasoning: reasoning,
                     dirty: false,
                 })
             }) {
@@ -520,22 +524,24 @@ impl App {
 
     fn save_message(&mut self, idx: usize) {
         let Some(conn) = self.begin_write() else { return };
-        let (id, content, role) = {
+        let (id, content, role, reasoning) = {
             let m = &self.messages[idx];
-            (m.id, m.edit_content.clone(), m.edit_role.clone())
+            (m.id, m.edit_content.clone(), m.edit_role.clone(), m.edit_reasoning.clone())
         };
         // Rewriting content/role must: (1) clear the api_content sidecar so the
         // model replays the NEW text, not stale bytes; (2) re-normalize
-        // finish_reason so the role is unambiguous on the wire.
+        // finish_reason so the role is unambiguous on the wire. The reasoning
+        // (思考过程) is written back to reasoning_content too.
         let finish = Self::finish_reason_for(&conn, id, &role);
         match conn.execute(
-            "UPDATE messages SET content=?1, role=?2, finish_reason=?3, api_content=NULL WHERE id=?4",
-            params![content, role, finish, id],
+            "UPDATE messages SET content=?1, role=?2, finish_reason=?3, api_content=NULL, reasoning_content=?4 WHERE id=?5",
+            params![content, role, finish, reasoning, id],
         ) {
             Ok(_) => {
                 let m = &mut self.messages[idx];
                 m.content = content;
                 m.role = role;
+                m.reasoning = reasoning;
                 m.dirty = false;
                 self.set_ok(format!("已保存 #{id}"));
             }
@@ -544,8 +550,13 @@ impl App {
     }
 
     fn save_all_dirty(&mut self) {
-        let dirties: Vec<usize> =
-            self.messages.iter().enumerate().filter(|(_, m)| m.dirty).map(|(i, _)| i).collect();
+        let dirties: Vec<usize> = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.dirty || m.edit_reasoning != m.reasoning)
+            .map(|(i, _)| i)
+            .collect();
         if dirties.is_empty() {
             self.set_ok("没有未保存更改");
             return;
@@ -553,11 +564,11 @@ impl App {
         let Some(mut conn) = self.begin_write() else { return };
         // Pre-compute each row's finish_reason BEFORE opening the transaction,
         // so the read-only queries above don't hold the write lock.
-        let mut updates: Vec<(i64, String, String, Option<String>)> = Vec::new();
+        let mut updates: Vec<(i64, String, String, Option<String>, String)> = Vec::new();
         for &i in &dirties {
             let m = &self.messages[i];
             let finish = Self::finish_reason_for(&conn, m.id, &m.edit_role);
-            updates.push((m.id, m.edit_content.clone(), m.edit_role.clone(), finish));
+            updates.push((m.id, m.edit_content.clone(), m.edit_role.clone(), finish, m.edit_reasoning.clone()));
         }
         let tx = match conn.transaction() {
             Ok(t) => t,
@@ -567,11 +578,11 @@ impl App {
             }
         };
         let mut ok = true;
-        for (id, content, role, finish) in &updates {
+        for (id, content, role, finish, reasoning) in &updates {
             if tx
                 .execute(
-                    "UPDATE messages SET content=?1, role=?2, finish_reason=?3, api_content=NULL WHERE id=?4",
-                    params![content, role, finish, id],
+                    "UPDATE messages SET content=?1, role=?2, finish_reason=?3, api_content=NULL, reasoning_content=?4 WHERE id=?5",
+                    params![content, role, finish, reasoning, id],
                 )
                 .is_err()
             {
@@ -584,6 +595,7 @@ impl App {
                 let m = &mut self.messages[i];
                 m.content = m.edit_content.clone();
                 m.role = m.edit_role.clone();
+                m.reasoning = m.edit_reasoning.clone();
                 m.dirty = false;
             }
             self.set_ok(format!("已保存 {} 条消息", dirties.len()));
@@ -847,6 +859,7 @@ impl App {
                     ts,
                     edit_content: content,
                     edit_role: role,
+                    edit_reasoning: String::new(),
                     dirty: false,
                 };
                 self.messages.insert(after_idx + 1, row);
@@ -889,6 +902,7 @@ impl App {
                     ts,
                     edit_content: text,
                     edit_role: role,
+                    edit_reasoning: String::new(),
                     dirty: false,
                 };
                 self.messages.push(row);
@@ -1694,11 +1708,17 @@ impl eframe::App for App {
                                 }
                             }
 
-                            if !self.messages[i].reasoning.is_empty() {
-                                egui::CollapsingHeader::new("reasoning").id_source(format!("reason_{id}")).show(
+                            if !self.messages[i].reasoning.is_empty() || !self.messages[i].edit_reasoning.is_empty() {
+                                egui::CollapsingHeader::new("reasoning（思考过程，可编辑）").id_source(format!("reason_{id}")).show(
                                     ui,
                                     |ui| {
-                                        ui.label(egui::RichText::new(&self.messages[i].reasoning).small().weak());
+                                        let te = egui::TextEdit::multiline(&mut self.messages[i].edit_reasoning)
+                                            .desired_width(f32::INFINITY)
+                                            .desired_rows(3)
+                                            .code_editor();
+                                        if ui.add(te).changed() {
+                                            self.messages[i].dirty = true;
+                                        }
                                     },
                                 );
                             }
@@ -2180,7 +2200,7 @@ fn simple_md_preview(s: &str) -> String {
 /// CLI-only: edit one message non-interactively, using the SAME write path the
 /// GUI save button uses (recompute finish_reason + clear the api_content
 /// sidecar). Returns a human-readable result line.
-fn cli_edit_message(db_path: &Path, message_id: i64, content: &str, role_opt: Option<&str>) -> Result<String, String> {
+fn cli_edit_message(db_path: &Path, message_id: i64, content: &str, role_opt: Option<&str>, reasoning_opt: Option<&str>) -> Result<String, String> {
     let conn = Connection::open(db_path).map_err(|e| format!("打开数据库失败: {e}"))?;
     let _ = conn.busy_timeout(std::time::Duration::from_millis(30000));
     let _ = conn.pragma_update(None, "foreign_keys", "ON");
@@ -2195,19 +2215,31 @@ fn cli_edit_message(db_path: &Path, message_id: i64, content: &str, role_opt: Op
             )
             .map_err(|e| format!("消息 #{message_id} 不存在或读取失败: {e}"))?,
     };
+    // Keep the stored reasoning unless the caller overrides it.
+    let reasoning = match reasoning_opt {
+        Some(r) => r.to_string(),
+        None => conn
+            .query_row(
+                "SELECT COALESCE(reasoning_content,'') FROM messages WHERE id=?1",
+                params![message_id],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap_or_default(),
+    };
     let finish = App::finish_reason_for(&conn, message_id, &role);
     let n = conn
         .execute(
-            "UPDATE messages SET content=?1, role=?2, finish_reason=?3, api_content=NULL WHERE id=?4",
-            params![content, role, finish, message_id],
+            "UPDATE messages SET content=?1, role=?2, finish_reason=?3, api_content=NULL, reasoning_content=?4 WHERE id=?5",
+            params![content, role, finish, reasoning, message_id],
         )
         .map_err(|e| format!("更新失败: {e}"))?;
     Ok(format!(
-        "OK: updated={} id={} role={} finish_reason={} api_content=NULL",
+        "OK: updated={} id={} role={} finish_reason={} api_content=NULL reasoning={}",
         n,
         message_id,
         role,
-        finish.as_deref().unwrap_or("(null)")
+        finish.as_deref().unwrap_or("(null)"),
+        if reasoning.is_empty() { "(empty)" } else { "set" }
     ))
 }
 
@@ -2229,7 +2261,7 @@ fn main() -> eframe::Result<()> {
              Usage:\n  hermes-chat-editor-native.exe [db_path] [--readonly] [--writable] [--help]\n\
              \n\
              Edit one message (CLI, no window):\n\
-             \x20 hermes-chat-editor-native.exe --edit <message_id> --content \"<text>\" [--role <role>] [--db <path>]\n\
+             \x20 hermes-chat-editor-native.exe --edit <message_id> --content \"<text>\" [--role <role>] [--reasoning <text>] [--db <path>]\n\
              \n\
              Options:\n  <path>          Open a specific state.db (default: %LOCALAPPDATA%/hermes/state.db)\n  --readonly      Open read-only (default)\n  --writable      Open in writable mode\n  --help, -h      Show this help\n"
         );
@@ -2240,6 +2272,7 @@ fn main() -> eframe::Result<()> {
         let mut edit_id: Option<i64> = None;
         let mut edit_content: Option<String> = None;
         let mut edit_role: Option<String> = None;
+        let mut edit_reasoning: Option<String> = None;
         let mut edit_db: Option<PathBuf> = None;
         let mut i = 1;
         while i < args.len() {
@@ -2250,6 +2283,9 @@ fn main() -> eframe::Result<()> {
                 }
                 "--role" => {
                     if i + 1 < args.len() { edit_role = Some(args[i + 1].clone()); i += 2; } else { i += 1; }
+                }
+                "--reasoning" => {
+                    if i + 1 < args.len() { edit_reasoning = Some(args[i + 1].clone()); i += 2; } else { i += 1; }
                 }
                 "--db" => {
                     if i + 1 < args.len() { edit_db = Some(PathBuf::from(&args[i + 1])); i += 2; } else { i += 1; }
@@ -2265,13 +2301,13 @@ fn main() -> eframe::Result<()> {
         match (edit_id, edit_content) {
             (Some(id), Some(content)) => {
                 let db = edit_db.unwrap_or_else(default_db_path);
-                match cli_edit_message(&db, id, &content, edit_role.as_deref()) {
+                match cli_edit_message(&db, id, &content, edit_role.as_deref(), edit_reasoning.as_deref()) {
                     Ok(msg) => println!("{msg}"),
                     Err(e) => eprintln!("错误: {e}"),
                 }
             }
             _ => {
-                eprintln!("用法: --edit <message_id> --content \"<text>\" [--role <role>] [--db <path>]");
+                eprintln!("用法: --edit <message_id> --content \"<text>\" [--role <role>] [--reasoning <text>] [--db <path>]");
             }
         }
         return Ok(());
