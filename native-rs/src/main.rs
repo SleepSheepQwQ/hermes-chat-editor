@@ -154,7 +154,6 @@ enum Modal {
     ConfirmRestore(PathBuf),
     Insert { after_idx: usize, role: String, content: String },
     SystemPrompt { buf: String, dirty: bool },
-    ConfirmForceWrite,
     ImportPath { buf: String },
 }
 
@@ -162,7 +161,6 @@ struct App {
     db_path: PathBuf,
     profile_paths: Vec<PathBuf>,
     read_only: bool,
-    force_write: bool,
     search: String,
     search_focused: bool,
     show_internal: bool,
@@ -200,7 +198,6 @@ impl App {
             db_path,
             profile_paths: profiles,
             read_only: true, // default to read-only for safety
-            force_write: false,
             search: String::new(),
             search_focused: false,
             show_internal: false,
@@ -317,14 +314,14 @@ impl App {
     }
 
     /// Centralized write entry: snapshot first, then hand back a connection.
-    /// Respects read-only mode and Hermes-running write protection.
+    /// Centralized write entry: snapshot first, then hand back a connection.
+    /// Editing is ALWAYS allowed (a Hermes-running banner is advisory only):
+    /// every write is auto-backup'd first and WAL + busy_timeout make concurrent
+    /// access safe, so blocking writes when Hermes is running was over-cautious
+    /// and made the editor unusable in the common case.
     fn begin_write(&mut self) -> Option<Connection> {
         if self.read_only {
-            self.set_err("当前为只读模式。请勾选“可写模式”后再编辑。");
-            return None;
-        }
-        if self.hermes_running && !self.force_write {
-            self.modal = Modal::ConfirmForceWrite;
+            self.set_err("当前为只读模式。请取消勾选“只读模式”后再编辑。");
             return None;
         }
         if self.backup().is_none() {
@@ -342,15 +339,16 @@ impl App {
     fn refresh_hermes_running(&mut self) {
         self.hermes_running = false;
         if let Ok(conn) = self.conn_readonly() {
-            if let Ok(mut st) = conn.prepare("SELECT last_heartbeat FROM gateway_heartbeats") {
-                let now = now_ts();
-                if let Ok(rows) = st.query_map([], |r| r.get::<_, f64>(0)) {
-                    for hb in rows.flatten() {
-                        if now - hb < HEARTBEAT_FRESH_SECS {
-                            self.hermes_running = true;
-                            return;
-                        }
-                    }
+            // Only the NEWEST heartbeat matters: older rows are stale gateway
+            // launches that are never cleaned up.
+            if let Ok(hb) = conn.query_row(
+                "SELECT MAX(last_heartbeat) FROM gateway_heartbeats",
+                [],
+                |r| r.get::<_, Option<f64>>(0),
+            ) {
+                if let Some(hb) = hb {
+                    let now = now_ts();
+                    self.hermes_running = now - hb < HEARTBEAT_FRESH_SECS;
                 }
             }
         }
@@ -1359,11 +1357,10 @@ impl eframe::App for App {
             if self.hermes_running && !self.read_only {
                 ui.colored_label(
                     egui::Color32::from_rgb(0xff, 0xd0, 0xd0),
-                    "⚠ Hermes 运行中 — 默认禁止写入。如需覆盖请勾选强制写入。",
+                    "⚠ 检测到 Hermes 正在运行：改动可能被 Hermes 的内存会话覆盖。建议先关闭 Hermes 再编辑（写入不会因此被阻止）。",
                 );
             }
             ui.horizontal(|ui| {
-                ui.checkbox(&mut self.force_write, "强制写入（危险）");
                 ui.checkbox(&mut self.md_preview, "Markdown 预览");
             });
             ui.horizontal(|ui| {
@@ -1528,12 +1525,12 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.hermes_running {
                 egui::Frame::none()
-                    .fill(egui::Color32::from_rgb(0x5a, 0x1e, 0x1e))
+                    .fill(egui::Color32::from_rgb(0x4a, 0x3a, 0x1e))
                     .inner_margin(egui::Margin::symmetric(10.0, 6.0))
                     .show(ui, |ui| {
                         ui.colored_label(
-                            egui::Color32::from_rgb(0xff, 0xd0, 0xd0),
-                            "⚠ 检测到 Hermes 正在运行：它可能用内存中的会话覆盖你的改动。默认禁止写入（可勾选“强制写入”覆盖）。",
+                            egui::Color32::from_rgb(0xff, 0xe0, 0xb0),
+                            "⚠ 检测到 Hermes 正在运行：改动可能被 Hermes 的内存会话覆盖。建议先关闭 Hermes 再编辑（写入不会被阻止，且已自动备份）。",
                         );
                     });
                 ui.add_space(4.0);
@@ -1834,10 +1831,10 @@ impl App {
                         } else {
                             ui.label(format!("删除选中的 {n} 条消息？此操作会写入数据库（已自动备份）。"));
                         }
-                        if self.hermes_running && !self.force_write {
+                        if self.hermes_running {
                             ui.colored_label(
-                                egui::Color32::from_rgb(0xff, 0xd0, 0xd0),
-                                "⚠ Hermes 正在运行，默认禁止写入。",
+                                egui::Color32::from_rgb(0xff, 0xe0, 0xb0),
+                                "⚠ Hermes 正在运行，改动可能被覆盖（已自动备份）。",
                             );
                         }
                         ui.horizontal(|ui| {
@@ -1993,35 +1990,6 @@ impl App {
                     self.restore_backup(&path);
                 } else if keep {
                     self.modal = Modal::ConfirmRestore(path);
-                }
-            }
-            Modal::ConfirmForceWrite => {
-                let mut keep = true;
-                let mut decided = false;
-                egui::Window::new("Hermes 正在运行")
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                    .show(ctx, |ui| {
-                        ui.label(
-                            "检测到 Hermes 正在运行，写入可能被它的内存会话覆盖。\n\
-                             是否强制写入？建议先关闭 Hermes 再编辑。",
-                        );
-                        ui.horizontal(|ui| {
-                            if ui.button("强制写入").clicked() {
-                                self.force_write = true;
-                                decided = true;
-                                keep = false;
-                            }
-                            if ui.button("取消").clicked() {
-                                keep = false;
-                            }
-                        });
-                    });
-                if decided {
-                    self.set_ok("已启用强制写入，请重试操作。");
-                } else if keep {
-                    self.modal = Modal::ConfirmForceWrite;
                 }
             }
             Modal::Insert { after_idx, mut role, mut content } => {
