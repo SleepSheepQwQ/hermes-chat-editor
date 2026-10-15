@@ -487,15 +487,52 @@ impl App {
         self.set_ok(format!("已载入 {} 条消息", self.messages.len()));
     }
 
+    /// Compute the correct `finish_reason` for a message that will carry `new_role`.
+    ///
+    /// Hermes relies on `finish_reason` to recognize a *complete* assistant turn
+    /// (`stop` or `tool_calls`). A pre-filled/edited assistant message with a NULL
+    /// finish_reason reads as an orphan and the model re-classifies it as a user
+    /// turn. Rules:
+    ///   - assistant with stored tool_calls  -> keep the stored finish_reason
+    ///     (fall back to "tool_calls" if it is empty)
+    ///   - assistant without tool_calls       -> "stop"
+    ///   - any other role                     -> NULL (finish_reason is assistant-only)
+    fn finish_reason_for(conn: &Connection, id: i64, new_role: &str) -> Option<String> {
+        if new_role != "assistant" {
+            return None;
+        }
+        let stored: Option<(String, String)> = conn
+            .query_row(
+                "SELECT COALESCE(finish_reason,''), COALESCE(tool_calls,'') FROM messages WHERE id=?1",
+                params![id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .ok();
+        match stored {
+            Some((finish, tool_calls)) if !tool_calls.trim().is_empty() => {
+                if finish.is_empty() {
+                    Some("tool_calls".to_string())
+                } else {
+                    Some(finish)
+                }
+            }
+            _ => Some("stop".to_string()),
+        }
+    }
+
     fn save_message(&mut self, idx: usize) {
         let Some(conn) = self.begin_write() else { return };
         let (id, content, role) = {
             let m = &self.messages[idx];
             (m.id, m.edit_content.clone(), m.edit_role.clone())
         };
+        // Rewriting content/role must: (1) clear the api_content sidecar so the
+        // model replays the NEW text, not stale bytes; (2) re-normalize
+        // finish_reason so the role is unambiguous on the wire.
+        let finish = Self::finish_reason_for(&conn, id, &role);
         match conn.execute(
-            "UPDATE messages SET content=?1, role=?2 WHERE id=?3",
-            params![content, role, id],
+            "UPDATE messages SET content=?1, role=?2, finish_reason=?3, api_content=NULL WHERE id=?4",
+            params![content, role, finish, id],
         ) {
             Ok(_) => {
                 let m = &mut self.messages[idx];
@@ -516,6 +553,14 @@ impl App {
             return;
         }
         let Some(mut conn) = self.begin_write() else { return };
+        // Pre-compute each row's finish_reason BEFORE opening the transaction,
+        // so the read-only queries above don't hold the write lock.
+        let mut updates: Vec<(i64, String, String, Option<String>)> = Vec::new();
+        for &i in &dirties {
+            let m = &self.messages[i];
+            let finish = Self::finish_reason_for(&conn, m.id, &m.edit_role);
+            updates.push((m.id, m.edit_content.clone(), m.edit_role.clone(), finish));
+        }
         let tx = match conn.transaction() {
             Ok(t) => t,
             Err(e) => {
@@ -524,12 +569,11 @@ impl App {
             }
         };
         let mut ok = true;
-        for &i in &dirties {
-            let m = &self.messages[i];
+        for (id, content, role, finish) in &updates {
             if tx
                 .execute(
-                    "UPDATE messages SET content=?1, role=?2 WHERE id=?3",
-                    params![m.edit_content, m.edit_role, m.id],
+                    "UPDATE messages SET content=?1, role=?2, finish_reason=?3, api_content=NULL WHERE id=?4",
+                    params![content, role, finish, id],
                 )
                 .is_err()
             {
@@ -628,6 +672,13 @@ impl App {
             return;
         }
         let Some(mut conn) = self.begin_write() else { return };
+        // Pre-compute finish_reason for each affected row (role may flip to/from
+        // assistant), and clear the api_content sidecar since role changes.
+        let mut updates: Vec<(i64, Option<String>)> = Vec::new();
+        for id in &ids {
+            let finish = Self::finish_reason_for(&conn, *id, role);
+            updates.push((*id, finish));
+        }
         let tx = match conn.transaction() {
             Ok(t) => t,
             Err(e) => {
@@ -636,8 +687,14 @@ impl App {
             }
         };
         let mut ok = true;
-        for id in &ids {
-            if tx.execute("UPDATE messages SET role=?1 WHERE id=?2", params![role, id]).is_err() {
+        for (id, finish) in &updates {
+            if tx
+                .execute(
+                    "UPDATE messages SET role=?1, finish_reason=?2, api_content=NULL WHERE id=?3",
+                    params![role, finish, id],
+                )
+                .is_err()
+            {
                 ok = false;
                 break;
             }
