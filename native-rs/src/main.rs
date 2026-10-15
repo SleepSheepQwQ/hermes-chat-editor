@@ -2209,21 +2209,103 @@ fn simple_md_preview(s: &str) -> String {
     out
 }
 
+/// CLI-only: edit one message non-interactively, using the SAME write path the
+/// GUI save button uses (recompute finish_reason + clear the api_content
+/// sidecar). Returns a human-readable result line.
+fn cli_edit_message(db_path: &Path, message_id: i64, content: &str, role_opt: Option<&str>) -> Result<String, String> {
+    let conn = Connection::open(db_path).map_err(|e| format!("打开数据库失败: {e}"))?;
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(30000));
+    let _ = conn.pragma_update(None, "foreign_keys", "ON");
+    // Keep the stored role unless the caller overrides it.
+    let role = match role_opt {
+        Some(r) => r.to_string(),
+        None => conn
+            .query_row(
+                "SELECT COALESCE(role,'') FROM messages WHERE id=?1",
+                params![message_id],
+                |r| r.get::<_, String>(0),
+            )
+            .map_err(|e| format!("消息 #{message_id} 不存在或读取失败: {e}"))?,
+    };
+    let finish = App::finish_reason_for(&conn, message_id, &role);
+    let n = conn
+        .execute(
+            "UPDATE messages SET content=?1, role=?2, finish_reason=?3, api_content=NULL WHERE id=?4",
+            params![content, role, finish, message_id],
+        )
+        .map_err(|e| format!("更新失败: {e}"))?;
+    Ok(format!(
+        "OK: updated={} id={} role={} finish_reason={} api_content=NULL",
+        n,
+        message_id,
+        role,
+        finish.as_deref().unwrap_or("(null)")
+    ))
+}
+
 fn main() -> eframe::Result<()> {
     // Argument parsing:
     //   hermes-chat-editor-native.exe                 -> default db
     //   hermes-chat-editor-native.exe <path>          -> open db at path
     //   hermes-chat-editor-native.exe --readonly      -> open default db read-only (default anyway)
     //   hermes-chat-editor-native.exe --help         -> print help and exit
+    //   hermes-chat-editor-native.exe --edit <message_id> --content "<text>" [--role <role>] [--db <path>]
+    //     -> non-interactive: edit one message via the same write path as the
+    //        GUI save button, then exit (no window).
     let args: Vec<String> = std::env::args().collect();
     let mut db_path: Option<PathBuf> = None;
     let mut read_only = true;
     if args.iter().any(|a| a == "--help" || a == "-h" || a == "help") {
         println!(
             "Hermes Chat Editor\n\
-             Usage:\n  hermes-chat-editor-native.exe [db_path] [--readonly] [--writable] [--help]\n\n\
-             Options:\n  <path>          Open a specific state.db (default: %%LOCALAPPDATA%%/hermes/state.db)\n  --readonly      Open read-only (default)\n  --writable      Open in writable mode\n  --help, -h      Show this help\n"
+             Usage:\n  hermes-chat-editor-native.exe [db_path] [--readonly] [--writable] [--help]\n\
+             \n\
+             Edit one message (CLI, no window):\n\
+             \x20 hermes-chat-editor-native.exe --edit <message_id> --content \"<text>\" [--role <role>] [--db <path>]\n\
+             \n\
+             Options:\n  <path>          Open a specific state.db (default: %LOCALAPPDATA%/hermes/state.db)\n  --readonly      Open read-only (default)\n  --writable      Open in writable mode\n  --help, -h      Show this help\n"
         );
+        return Ok(());
+    }
+    // CLI edit mode: run the edit, print the result, and exit without a window.
+    if args.iter().any(|a| a == "--edit") {
+        let mut edit_id: Option<i64> = None;
+        let mut edit_content: Option<String> = None;
+        let mut edit_role: Option<String> = None;
+        let mut edit_db: Option<PathBuf> = None;
+        let mut i = 1;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--edit" => { i += 1; }
+                "--content" => {
+                    if i + 1 < args.len() { edit_content = Some(args[i + 1].clone()); i += 2; } else { i += 1; }
+                }
+                "--role" => {
+                    if i + 1 < args.len() { edit_role = Some(args[i + 1].clone()); i += 2; } else { i += 1; }
+                }
+                "--db" => {
+                    if i + 1 < args.len() { edit_db = Some(PathBuf::from(&args[i + 1])); i += 2; } else { i += 1; }
+                }
+                other => {
+                    if edit_id.is_none() {
+                        if let Ok(v) = other.parse::<i64>() { edit_id = Some(v); }
+                    }
+                    i += 1;
+                }
+            }
+        }
+        match (edit_id, edit_content) {
+            (Some(id), Some(content)) => {
+                let db = edit_db.unwrap_or_else(default_db_path);
+                match cli_edit_message(&db, id, &content, edit_role.as_deref()) {
+                    Ok(msg) => println!("{msg}"),
+                    Err(e) => eprintln!("错误: {e}"),
+                }
+            }
+            _ => {
+                eprintln!("用法: --edit <message_id> --content \"<text>\" [--role <role>] [--db <path>]");
+            }
+        }
         return Ok(());
     }
     for a in &args[1..] {
