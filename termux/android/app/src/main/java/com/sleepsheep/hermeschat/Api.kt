@@ -30,6 +30,9 @@ data class Message(
 
 class BridgeException(val code: Int, message: String) : Exception(message)
 
+/** org.json turns JSON null into the literal "null"; keep that out of the UI. */
+fun JSONObject.text(key: String): String = if (isNull(key)) "" else optString(key, "")
+
 /**
  * Thin HTTP client for the Termux bridge (termux/bridge/hermes_chat_bridge.py).
  * No third-party deps: HttpURLConnection + org.json, both in the framework.
@@ -86,8 +89,8 @@ class Bridge(baseUrl: String, token: String) {
             val o = arr.getJSONObject(i)
             Session(
                 id = o.optString("id"),
-                title = o.optString("title").ifBlank { o.optString("id") },
-                source = o.optString("source"),
+                title = o.text("title").ifBlank { o.optString("id") },
+                source = o.text("source"),
                 messageCount = o.optInt("message_count"),
                 lastActivity = o.optDouble("last_activity_at", 0.0),
                 pinned = o.optInt("pinned") == 1,
@@ -102,12 +105,12 @@ class Bridge(baseUrl: String, token: String) {
             val o = arr.getJSONObject(i)
             Message(
                 id = o.optLong("id"),
-                role = o.optString("role"),
-                content = o.optString("content"),
+                role = o.text("role"),
+                content = o.text("content"),
                 ord = o.optLong("ord"),
                 timestamp = o.optDouble("timestamp", 0.0),
-                toolName = o.optString("tool_name").ifBlank { null },
-                hasToolCalls = o.optString("tool_calls").isNotBlank(),
+                toolName = o.text("tool_name").ifBlank { null },
+                hasToolCalls = o.text("tool_calls").isNotBlank(),
             )
         }
     }
@@ -120,12 +123,12 @@ class Bridge(baseUrl: String, token: String) {
         val o = JSONObject(patch("/messages/$id", body))
         return Message(
             id = o.optLong("id"),
-            role = o.optString("role"),
-            content = o.optString("content"),
+            role = o.text("role"),
+            content = o.text("content"),
             ord = o.optLong("ord"),
             timestamp = o.optDouble("timestamp", 0.0),
-            toolName = o.optString("tool_name").ifBlank { null },
-            hasToolCalls = o.optString("tool_calls").isNotBlank(),
+            toolName = o.text("tool_name").ifBlank { null },
+            hasToolCalls = o.text("tool_calls").isNotBlank(),
         )
     }
 
@@ -135,12 +138,12 @@ class Bridge(baseUrl: String, token: String) {
         val o = JSONObject(post("/sessions/${enc(sessionId)}/messages", body))
         return Message(
             id = o.optLong("id"),
-            role = o.optString("role"),
-            content = o.optString("content"),
+            role = o.text("role"),
+            content = o.text("content"),
             ord = o.optLong("ord"),
             timestamp = o.optDouble("timestamp", 0.0),
-            toolName = o.optString("tool_name").ifBlank { null },
-            hasToolCalls = o.optString("tool_calls").isNotBlank(),
+            toolName = o.text("tool_name").ifBlank { null },
+            hasToolCalls = o.text("tool_calls").isNotBlank(),
         )
     }
 

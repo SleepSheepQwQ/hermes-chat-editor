@@ -52,19 +52,24 @@ object TestRunner {
             "${checks.length()} bridge checks passed"
         }
 
-        var firstSession: Session? = null
         check("list sessions") {
             val list = bridge.sessions()
             if (list.isEmpty()) throw IllegalStateException("no sessions")
-            firstSession = list.first()
-            "${list.size} sessions, newest=${list.first().id}"
+            val filled = list.count { it.messageCount > 0 }
+            "${list.size} sessions ($filled with messages), newest=${list.first().id}"
         }
 
+        // Newest sessions can legitimately be empty (imports, probe leftovers),
+        // so walk the list until a session actually has rows to read.
         check("read messages") {
-            val s = firstSession ?: throw IllegalStateException("no session")
-            val msgs = bridge.messages(s.id)
-            if (msgs.isEmpty()) throw IllegalStateException("session ${s.id} has no messages")
-            "${msgs.size} messages, first=#${msgs.first().id} ${msgs.first().role}"
+            for (s in bridge.sessions()) {
+                val msgs = bridge.messages(s.id)
+                if (msgs.isNotEmpty()) {
+                    return@check "${msgs.size} messages in ${s.id}, " +
+                        "first=#${msgs.first().id} ${msgs.first().role}"
+                }
+            }
+            throw IllegalStateException("no session contains messages")
         }
 
         check("write probe (create→edit→truncate→delete)") {
