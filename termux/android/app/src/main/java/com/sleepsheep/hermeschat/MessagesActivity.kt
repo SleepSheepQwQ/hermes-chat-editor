@@ -67,6 +67,7 @@ class MessagesActivity : Activity() {
             }
         }
         root.addView(listView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        listView.adapter = MessageAdapter()
 
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
