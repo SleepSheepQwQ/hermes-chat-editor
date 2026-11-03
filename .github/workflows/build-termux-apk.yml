@@ -1,0 +1,71 @@
+name: build-termux-apk
+
+# Builds termux/android (Kotlin) into a debug APK and runs the bridge's
+# end-to-end test on every push that touches the termux module.
+# Nothing here needs a device: the APK is installed locally afterwards.
+
+on:
+  push:
+    branches: ["termux", "master"]
+    tags: ["termux-v*"]
+    paths:
+      - "termux/**"
+      - ".github/workflows/build-termux-apk.yml"
+  pull_request:
+    paths:
+      - "termux/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bridge-test:
+    name: bridge e2e (python, no deps)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Syntax check
+        run: python3 -m py_compile termux/bridge/hermes_chat_bridge.py termux/bridge/test_bridge.py
+      - name: End-to-end test (token auth on)
+        run: python3 termux/bridge/test_bridge.py -v
+
+  build-apk:
+    name: kotlin apk (debug)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Build debug APK
+        run: gradle -p termux/android :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Show output
+        run: ls -lh termux/android/app/build/outputs/apk/debug/
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-chat-termux-debug
+          path: termux/android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach to release on tag
+        if: startsWith(github.ref, 'refs/tags/termux-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: termux/android/app/build/outputs/apk/debug/*.apk
